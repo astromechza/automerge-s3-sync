@@ -408,7 +408,10 @@ func (s *S3Impl) DeleteObjects(ctx context.Context, keys []string) (notDeleted [
 			for i, respError := range de.Errors {
 				notDeleted[i] = [2]string{respError.Key, respError.Code}
 			}
-			return notDeleted, nil
+			if len(notDeleted) > 0 {
+				err = fmt.Errorf("some objects failed to be deleted")
+			}
+			return notDeleted, err
 		}
 	}
 }
