@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"testing"
+	"time"
 )
 
 func testS3Interface(t *testing.T, impl S3) {
@@ -168,4 +169,50 @@ func TestS3Api_no_auth(t *testing.T) {
 		http.DefaultClient,
 		u,
 	))
+}
+
+// sudo docker run --rm -it -p 4566:4566 --name localstack localstack/localstack
+// sudo docker exec localstack awslocal s3api create-bucket --bucket smoke --region us-east-1
+// S3_SMOKE_TEST_BUCKET_URL=http://localhost:4566/smoke/ go test -v ./...
+func TestS3Api_authed(t *testing.T) {
+	v := os.Getenv("S3_SMOKE_TEST_BUCKET_URL")
+	if v == "" {
+		t.Skip("S3_SMOKE_TEST_BUCKET_URL not set")
+		return
+	}
+	u, _ := url.Parse(v)
+
+	client := &http.Client{}
+	client.Transport = WrapSigV4RoundTripper(http.DefaultTransport, time.Now, "us-east-1", "fake", "fake")
+
+	testS3Interface(t, NewS3Impl(
+		client,
+		u,
+	))
+}
+
+// sudo docker run --rm -it -p 4566:4566 --name localstack localstack/localstack
+// sudo docker exec localstack awslocal s3api create-bucket --bucket smoke --region us-east-1
+// S3_SMOKE_TEST_BUCKET_URL=http://localhost:4566/smoke/ go test -v ./...
+func TestS3Api_encrypted(t *testing.T) {
+	v := os.Getenv("S3_SMOKE_TEST_BUCKET_URL")
+	if v == "" {
+		t.Skip("S3_SMOKE_TEST_BUCKET_URL not set")
+		return
+	}
+	u, _ := url.Parse(v)
+
+	rk := make([]byte, 16)
+	_, err := rand.Read(rk)
+	AssertEqual(t, err, nil)
+	bc, err := aes.NewCipher(rk)
+	AssertEqual(t, err, nil)
+
+	testS3Interface(t, &ClientEncryptedS3{
+		S3: NewS3Impl(
+			http.DefaultClient,
+			u,
+		),
+		BlockCipher: bc,
+	})
 }
