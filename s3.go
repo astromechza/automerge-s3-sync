@@ -14,7 +14,9 @@ import (
 	"maps"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
+	"sync"
 )
 
 type S3 interface {
@@ -24,6 +26,143 @@ type S3 interface {
 	PutObject(ctx context.Context, key string, meta map[string]string, body io.Reader) (err error)
 	DeleteObjects(ctx context.Context, keys []string) (notDeleted [][2]string, err error)
 }
+
+type InMemoryS3 struct {
+	mux     sync.RWMutex
+	objects map[string][]byte
+	metas   map[string]map[string]string
+}
+
+func (i *InMemoryS3) GetObject(ctx context.Context, key string, dst io.Writer) (meta map[string]string, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	i.mux.RLock()
+	defer i.mux.RUnlock()
+	if meta = i.metas[key]; meta != nil {
+		meta = maps.Clone(meta)
+	}
+	if obj, ok := i.objects[key]; !ok {
+		return nil, fmt.Errorf("object not found")
+	} else if _, err := dst.Write(obj); err != nil {
+		return meta, err
+	}
+	return meta, nil
+}
+
+func (i *InMemoryS3) HeadObject(ctx context.Context, key string) (size int64, meta map[string]string, err error) {
+	if err := ctx.Err(); err != nil {
+		return 0, nil, err
+	}
+	i.mux.RLock()
+	defer i.mux.RUnlock()
+	if meta = i.metas[key]; meta != nil {
+		meta = maps.Clone(meta)
+	}
+	if obj, ok := i.objects[key]; !ok {
+		return 0, nil, fmt.Errorf("object not found")
+	} else {
+		return int64(len(obj)), meta, nil
+	}
+}
+
+type twoSliceSorter struct {
+	keySlice  []string
+	sizeSlice []int64
+}
+
+func (t *twoSliceSorter) Len() int {
+	return len(t.keySlice)
+}
+
+func (t *twoSliceSorter) Less(i, j int) bool {
+	return t.keySlice[i] < t.keySlice[j]
+}
+
+func (t *twoSliceSorter) Swap(i, j int) {
+	t.keySlice[i], t.keySlice[j] = t.keySlice[j], t.keySlice[i]
+	t.sizeSlice[i], t.sizeSlice[j] = t.sizeSlice[j], t.sizeSlice[i]
+}
+
+var _ sort.Interface = (*twoSliceSorter)(nil)
+
+func (i *InMemoryS3) ListObjects(ctx context.Context, prefix string, delimiter string) (keys []string, sizes []int64, prefixes []string, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+	i.mux.RLock()
+	defer i.mux.RUnlock()
+
+	keys = make([]string, 0, len(i.objects))
+	sizes = make([]int64, 0, len(i.objects))
+	prefixSet := make(map[string]bool)
+
+	for key, obj := range i.objects {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if delimiter != "" {
+			x := strings.Index(key[len(prefix):], delimiter)
+			if x >= 0 {
+				prefixSet[key[len(prefix):len(prefix)+x]] = true
+				continue
+			}
+		}
+		keys = append(keys, key)
+		sizes = append(sizes, int64(len(obj)))
+	}
+
+	prefixes = make([]string, 0, len(prefixSet))
+	for s := range prefixSet {
+		prefixes = append(prefixes, s)
+	}
+	sort.Strings(prefixes)
+	sort.Sort(&twoSliceSorter{keySlice: keys, sizeSlice: sizes})
+	return keys, sizes, prefixes, nil
+}
+
+func (i *InMemoryS3) PutObject(ctx context.Context, key string, meta map[string]string, body io.Reader) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	i.mux.Lock()
+	defer i.mux.Unlock()
+	raw, err := io.ReadAll(body)
+	if err != nil {
+		return err
+	}
+	if i.objects == nil {
+		i.objects = make(map[string][]byte)
+		i.metas = make(map[string]map[string]string)
+	}
+	i.objects[key] = bytes.Clone(raw)
+	if meta == nil {
+		i.metas[key] = (map[string]string)(nil)
+	} else {
+		i.metas[key] = maps.Clone(meta)
+	}
+	return nil
+}
+
+func (i *InMemoryS3) DeleteObjects(ctx context.Context, keys []string) (notDeleted [][2]string, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	i.mux.Lock()
+	defer i.mux.Unlock()
+	notDeleted = make([][2]string, 0, len(keys))
+	for _, key := range keys {
+		if _, ok := i.objects[key]; !ok {
+			notDeleted = append(notDeleted, [2]string{key, "object not found"})
+		} else {
+			delete(i.objects, key)
+		}
+	}
+	return
+}
+
+var _ S3 = (*InMemoryS3)(nil)
 
 type HttpDoer interface {
 	Do(req *http.Request) (*http.Response, error)
@@ -167,6 +306,8 @@ func (s *S3Impl) ListObjects(ctx context.Context, prefix string, delimiter strin
 			break
 		}
 	}
+	sort.Strings(prefixes)
+	sort.Sort(&twoSliceSorter{keySlice: keys, sizeSlice: sizes})
 	return
 }
 
