@@ -1,6 +1,7 @@
 package automerge_s3_sync
 
 import (
+	"errors"
 	"reflect"
 	"slices"
 	"testing"
@@ -38,6 +39,18 @@ func AssertErrorEqual(t *testing.T, actual error, expected string) bool {
 		return false
 	} else if actual.Error() != expected {
 		t.Errorf("expected error: %v to equal %s", actual.Error(), expected)
+		return false
+	}
+	return true
+}
+
+func AssertErrorIs(t *testing.T, actual error, expected error) bool {
+	t.Helper()
+	if actual == nil {
+		t.Errorf("expected an error, got nil")
+		return false
+	} else if !errors.Is(actual, expected) {
+		t.Errorf("expected error: %v to be a %s", actual.Error(), expected)
 		return false
 	}
 	return true

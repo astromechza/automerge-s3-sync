@@ -6,8 +6,9 @@ import (
 	"crypto/cipher"
 	"crypto/md5"
 	"crypto/rand"
-	"encoding/hex"
+	"encoding/base64"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -27,6 +28,8 @@ type S3 interface {
 	DeleteObjects(ctx context.Context, keys []string) (notDeleted [][2]string, err error)
 }
 
+var ErrObjectNotFound = errors.New("object not found")
+
 type InMemoryS3 struct {
 	mux     sync.RWMutex
 	objects map[string][]byte
@@ -39,11 +42,12 @@ func (i *InMemoryS3) GetObject(ctx context.Context, key string, dst io.Writer) (
 	}
 	i.mux.RLock()
 	defer i.mux.RUnlock()
-	if meta = i.metas[key]; meta != nil {
-		meta = maps.Clone(meta)
+	meta = maps.Clone(i.metas[key])
+	if meta == nil {
+		meta = map[string]string{}
 	}
 	if obj, ok := i.objects[key]; !ok {
-		return nil, fmt.Errorf("object not found")
+		return nil, ErrObjectNotFound
 	} else if _, err := dst.Write(obj); err != nil {
 		return meta, err
 	}
@@ -56,11 +60,12 @@ func (i *InMemoryS3) HeadObject(ctx context.Context, key string) (size int64, me
 	}
 	i.mux.RLock()
 	defer i.mux.RUnlock()
-	if meta = i.metas[key]; meta != nil {
-		meta = maps.Clone(meta)
+	meta = maps.Clone(i.metas[key])
+	if meta == nil {
+		meta = map[string]string{}
 	}
 	if obj, ok := i.objects[key]; !ok {
-		return 0, nil, fmt.Errorf("object not found")
+		return 0, nil, ErrObjectNotFound
 	} else {
 		return int64(len(obj)), meta, nil
 	}
@@ -104,7 +109,7 @@ func (i *InMemoryS3) ListObjects(ctx context.Context, prefix string, delimiter s
 		if delimiter != "" {
 			x := strings.Index(key[len(prefix):], delimiter)
 			if x >= 0 {
-				prefixSet[key[len(prefix):len(prefix)+x]] = true
+				prefixSet[key[:len(prefix)+x+len(delimiter)]] = true
 				continue
 			}
 		}
@@ -136,11 +141,7 @@ func (i *InMemoryS3) PutObject(ctx context.Context, key string, meta map[string]
 		i.metas = make(map[string]map[string]string)
 	}
 	i.objects[key] = bytes.Clone(raw)
-	if meta == nil {
-		i.metas[key] = (map[string]string)(nil)
-	} else {
-		i.metas[key] = maps.Clone(meta)
-	}
+	i.metas[key] = maps.Clone(meta)
 	return nil
 }
 
@@ -153,11 +154,7 @@ func (i *InMemoryS3) DeleteObjects(ctx context.Context, keys []string) (notDelet
 	defer i.mux.Unlock()
 	notDeleted = make([][2]string, 0, len(keys))
 	for _, key := range keys {
-		if _, ok := i.objects[key]; !ok {
-			notDeleted = append(notDeleted, [2]string{key, "object not found"})
-		} else {
-			delete(i.objects, key)
-		}
+		delete(i.objects, key)
 	}
 	return
 }
@@ -204,6 +201,9 @@ func (s *S3Impl) readBlob(ctx context.Context, key, method string, dst io.Writer
 			_ = resp.Body.Close()
 		}()
 		if resp.StatusCode != http.StatusOK {
+			if resp.StatusCode == http.StatusNotFound {
+				return size, meta, ErrObjectNotFound
+			}
 			return size, meta, fmt.Errorf("failed to make request due to status code: %s", resp.Status)
 		}
 		if dst != nil {
@@ -214,7 +214,7 @@ func (s *S3Impl) readBlob(ctx context.Context, key, method string, dst io.Writer
 				return resp.ContentLength, meta, fmt.Errorf("failed to copy response body: %w", err)
 			}
 			if hA := r.Header.Get("Content-MD5"); hA != "" {
-				if hB := hex.EncodeToString(dst.(*hashWriter).H.Sum(nil)); hA != hB {
+				if hB := base64.StdEncoding.EncodeToString(dst.(*hashWriter).H.Sum(nil)); hA != hB {
 					return resp.ContentLength, meta, fmt.Errorf("integrity check failed: %s != %s", hA, hB)
 				}
 			}
@@ -236,7 +236,7 @@ func (s *S3Impl) GetObject(ctx context.Context, key string, dst io.Writer) (meta
 }
 
 func (s *S3Impl) HeadObject(ctx context.Context, key string) (size int64, meta map[string]string, err error) {
-	return s.readBlob(ctx, http.MethodHead, key, nil)
+	return s.readBlob(ctx, key, http.MethodHead, nil)
 }
 
 // listObjectsV2 performs https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html.
@@ -318,7 +318,7 @@ func (s *S3Impl) PutObject(ctx context.Context, key string, meta map[string]stri
 	} else {
 		h := md5.New()
 		_, _ = h.Write(raw)
-		md5h = hex.EncodeToString(h.Sum(nil))
+		md5h = base64.StdEncoding.EncodeToString(h.Sum(nil))
 		body = bytes.NewReader(raw)
 	}
 	if r, err := http.NewRequestWithContext(ctx, http.MethodPut, s.bucketUrl.ResolveReference(&url.URL{Path: key}).String(), body); err != nil {
@@ -334,8 +334,9 @@ func (s *S3Impl) PutObject(ctx context.Context, key string, meta map[string]stri
 			defer func() {
 				_ = resp.Body.Close()
 			}()
-			if resp.StatusCode != http.StatusOK {
-				return fmt.Errorf("failed to make request due to status code: %s", resp.Status)
+			if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+				raw, _ := io.ReadAll(resp.Body)
+				return fmt.Errorf("failed to make put request due to status code: %s: %s", resp.Status, string(raw))
 			}
 		}
 		return nil
@@ -374,20 +375,6 @@ type deleteObjectsRespError struct {
 func (s *S3Impl) DeleteObjects(ctx context.Context, keys []string) (notDeleted [][2]string, err error) {
 	if len(keys) == 0 {
 		return nil, nil
-	} else if len(keys) == 1 {
-		if r, err := http.NewRequestWithContext(ctx, http.MethodDelete, s.bucketUrl.ResolveReference(&url.URL{Path: keys[0]}).String(), nil); err != nil {
-			return nil, fmt.Errorf("failed to build request: %w", err)
-		} else if resp, err := s.client.Do(r); err != nil {
-			return nil, fmt.Errorf("failed to make request: %w", err)
-		} else {
-			defer func() {
-				_ = resp.Body.Close()
-			}()
-			if resp.StatusCode != http.StatusOK {
-				return nil, fmt.Errorf("failed to make request due to status code: %s", resp.Status)
-			}
-		}
-		return nil, nil
 	} else if len(keys) >= 1000 {
 		return nil, fmt.Errorf("delete not implemented for >= 1000 items")
 	} else {
@@ -405,7 +392,7 @@ func (s *S3Impl) DeleteObjects(ctx context.Context, keys []string) (notDeleted [
 				_ = resp.Body.Close()
 			}()
 			if resp.StatusCode != http.StatusOK {
-				return nil, fmt.Errorf("failed to make request due to status code: %s", resp.Status)
+				return nil, fmt.Errorf("failed to make delete request due to status code: %s", resp.Status)
 			}
 			buff, _ := io.ReadAll(resp.Body)
 			var e errorResp
@@ -477,12 +464,18 @@ func (s *ClientEncryptedS3) PutObject(ctx context.Context, key string, meta map[
 	} else if n, err := io.ReadAll(body); err != nil {
 		return fmt.Errorf("failed to buffer data: %w", err)
 	} else {
+		meta = maps.Clone(meta)
+		if meta == nil {
+			meta = make(map[string]string)
+		}
+		meta["cipher-mode"] = "GCM"
 		nonce := make([]byte, gcm.NonceSize())
 		if _, err := rand.Read(nonce); err != nil {
 			return fmt.Errorf("failed to generate nonce: %w", err)
 		}
-		meta = maps.Clone(meta)
-		meta["cipher-mode"] = "GCM"
-		return s.S3.PutObject(ctx, key, meta, bytes.NewReader(gcm.Seal(n[:0], nonce, n, nil)))
+		return s.S3.PutObject(ctx, key, meta, io.MultiReader(
+			bytes.NewReader(nonce),
+			bytes.NewReader(gcm.Seal(n[:0], nonce, n, nil)),
+		))
 	}
 }
