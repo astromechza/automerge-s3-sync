@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/cipher"
-	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/xml"
 	"errors"
@@ -207,13 +207,13 @@ func (s *S3Impl) readBlob(ctx context.Context, key, method string, dst io.Writer
 			return size, meta, fmt.Errorf("failed to make request due to status code: %s", resp.Status)
 		}
 		if dst != nil {
-			if r.Header.Get("Content-MD5") != "" {
-				dst = &hashWriter{H: md5.New(), W: dst}
+			if r.Header.Get("x-amz-checksum-sha256") != "" {
+				dst = &hashWriter{H: sha256.New(), W: dst}
 			}
 			if _, err := io.Copy(dst, resp.Body); err != nil {
 				return resp.ContentLength, meta, fmt.Errorf("failed to copy response body: %w", err)
 			}
-			if hA := r.Header.Get("Content-MD5"); hA != "" {
+			if hA := r.Header.Get("x-amz-checksum-sha256"); hA != "" {
 				if hB := base64.StdEncoding.EncodeToString(dst.(*hashWriter).H.Sum(nil)); hA != hB {
 					return resp.ContentLength, meta, fmt.Errorf("integrity check failed: %s != %s", hA, hB)
 				}
@@ -312,19 +312,20 @@ func (s *S3Impl) ListObjects(ctx context.Context, prefix string, delimiter strin
 }
 
 func (s *S3Impl) PutObject(ctx context.Context, key string, meta map[string]string, body io.Reader) (err error) {
-	var md5h string
+	var checksum string
 	if raw, err := io.ReadAll(body); err != nil {
 		return fmt.Errorf("failed to read buffered body: %w", err)
 	} else {
-		h := md5.New()
+		h := sha256.New()
 		_, _ = h.Write(raw)
-		md5h = base64.StdEncoding.EncodeToString(h.Sum(nil))
+		checksum = base64.StdEncoding.EncodeToString(h.Sum(nil))
 		body = bytes.NewReader(raw)
 	}
 	if r, err := http.NewRequestWithContext(ctx, http.MethodPut, s.bucketUrl.ResolveReference(&url.URL{Path: key}).String(), body); err != nil {
 		return fmt.Errorf("failed to build request: %w", err)
 	} else {
-		r.Header.Set("Content-MD5", md5h)
+		r.Header.Set("x-amz-sdk-checksum-algorithm", "SHA256")
+		r.Header.Set("x-amz-checksum-sha256", checksum)
 		for s2, s3 := range meta {
 			r.Header.Set("x-amz-meta-"+s2, s3)
 		}
