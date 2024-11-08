@@ -25,7 +25,7 @@ type S3 interface {
 	HeadObject(ctx context.Context, key string) (size int64, meta map[string]string, err error)
 	ListObjects(ctx context.Context, prefix string, delimiter string) (keys []string, sizes []int64, prefixes []string, err error)
 	PutObject(ctx context.Context, key string, meta map[string]string, body io.Reader) (err error)
-	DeleteObjects(ctx context.Context, keys []string) (notDeleted [][2]string, err error)
+	DeleteObject(ctx context.Context, key string) error
 }
 
 var ErrObjectNotFound = errors.New("object not found")
@@ -145,18 +145,14 @@ func (i *InMemoryS3) PutObject(ctx context.Context, key string, meta map[string]
 	return nil
 }
 
-func (i *InMemoryS3) DeleteObjects(ctx context.Context, keys []string) (notDeleted [][2]string, err error) {
+func (i *InMemoryS3) DeleteObject(ctx context.Context, key string) error {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return err
 	}
-
 	i.mux.Lock()
 	defer i.mux.Unlock()
-	notDeleted = make([][2]string, 0, len(keys))
-	for _, key := range keys {
-		delete(i.objects, key)
-	}
-	return
+	delete(i.objects, key)
+	return nil
 }
 
 var _ S3 = (*InMemoryS3)(nil)
@@ -348,81 +344,22 @@ func (s *S3Impl) PutObject(ctx context.Context, key string, meta map[string]stri
 	}
 }
 
-type deleteObjectsBody struct {
-	XMLName xml.Name              `xml:"Delete"`
-	Objects []deleteObjectsObject `xml:"Object"`
-	Quiet   bool                  `xml:"Quiet"`
-}
-
-type deleteObjectsObject struct {
-	Key string `xml:"Key"`
-}
-
-type errorResp struct {
-	XMLName   xml.Name `xml:"Error"`
-	Code      string   `xml:"Code"`
-	Message   string   `xml:"Message"`
-	RequestId string   `xml:"RequestId"`
-}
-
-type deleteObjectsResp struct {
-	XMLName xml.Name                 `xml:"DeleteResult"`
-	Errors  []deleteObjectsRespError `xml:"Error"`
-}
-
-type deleteObjectsRespError struct {
-	XMLName xml.Name `xml:"Error"`
-	Key     string   `xml:"Key"`
-	Code    string   `xml:"Code"`
-	Message string   `xml:"Message"`
-}
-
-func (s *S3Impl) DeleteObjects(ctx context.Context, keys []string) (notDeleted [][2]string, err error) {
-	if len(keys) == 0 {
-		return nil, nil
-	} else if len(keys) >= 1000 {
-		return nil, fmt.Errorf("delete not implemented for >= 1000 items")
+func (s *S3Impl) DeleteObject(ctx context.Context, key string) error {
+	if r, err := http.NewRequestWithContext(ctx, http.MethodDelete, s.bucketUrl.ResolveReference(&url.URL{Path: key}).String(), nil); err != nil {
+		return fmt.Errorf("failed to build request: %w", err)
+	} else if resp, err := s.client.Do(r); err != nil {
+		return fmt.Errorf("failed to make request: %w", err)
 	} else {
-		body := &deleteObjectsBody{Objects: make([]deleteObjectsObject, 0, len(keys)), Quiet: true}
-		for _, k := range keys {
-			body.Objects = append(body.Objects, deleteObjectsObject{Key: k})
+		defer func() {
+			_ = resp.Body.Close()
+		}()
+		// delete object has various interpretations depending on the storage provider. GCS doesn't support bulk delete and returns
+		// a 404 for objects that are not found which is wrong but we should handle it here.
+		if (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices) && resp.StatusCode != http.StatusNotFound {
+			bod, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("failed to make delete request due to status code: %s: %s", resp.Status, string(bod))
 		}
-		rawBod, _ := xml.Marshal(body)
-		md5h := md5.New()
-		md5h.Write(rawBod)
-		if r, err := http.NewRequestWithContext(ctx, http.MethodPost, s.bucketUrl.ResolveReference(&url.URL{RawQuery: "delete"}).String(), bytes.NewReader(rawBod)); err != nil {
-			return nil, fmt.Errorf("failed to build request: %w", err)
-		} else {
-			r.Header.Set("Content-MD5", base64.StdEncoding.EncodeToString(md5h.Sum(nil)))
-			if resp, err := s.client.Do(r); err != nil {
-				return nil, fmt.Errorf("failed to make request: %w", err)
-			} else {
-				defer func() {
-					_ = resp.Body.Close()
-				}()
-				if resp.StatusCode != http.StatusOK {
-					bod, _ := io.ReadAll(resp.Body)
-					return nil, fmt.Errorf("failed to make delete request due to status code: %s: %s", resp.Status, string(bod))
-				}
-				buff, _ := io.ReadAll(resp.Body)
-				var e errorResp
-				if _ = xml.Unmarshal(buff, &e); e.Code != "" {
-					return nil, fmt.Errorf("delete request returned an error: %s: %s (%s)", e.Code, e.Message, e.RequestId)
-				}
-				var de deleteObjectsResp
-				if err := xml.Unmarshal(buff, &de); err != nil {
-					return nil, fmt.Errorf("failed to unmarshal delete response: %w", err)
-				}
-				notDeleted = make([][2]string, len(de.Errors))
-				for i, respError := range de.Errors {
-					notDeleted[i] = [2]string{respError.Key, respError.Code}
-				}
-				if len(notDeleted) > 0 {
-					err = fmt.Errorf("some objects failed to be deleted")
-				}
-				return notDeleted, err
-			}
-		}
+		return nil
 	}
 }
 

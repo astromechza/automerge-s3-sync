@@ -19,9 +19,9 @@ func testS3Interface(t *testing.T, impl S3) {
 		// cleanup bucket
 		k, _, _, err := impl.ListObjects(context.Background(), "", "")
 		AssertEqual(t, err, nil)
-		nd, err := impl.DeleteObjects(context.Background(), k)
-		AssertEqual(t, err, nil)
-		AssertEqual(t, len(nd), 0)
+		for _, kk := range k {
+			AssertEqual(t, impl.DeleteObject(context.Background(), kk), nil)
+		}
 	}
 
 	defer cleanup(t)
@@ -59,9 +59,7 @@ func testS3Interface(t *testing.T, impl S3) {
 			AssertEqual(t, m, nil)
 		})
 		t.Run("delete", func(t *testing.T) {
-			nd, err := impl.DeleteObjects(context.Background(), []string{"thing"})
-			AssertEqual(t, err, nil)
-			AssertEqual(t, nd, [][2]string{})
+			AssertEqual(t, impl.DeleteObject(context.Background(), "thing"), nil)
 		})
 	})
 
@@ -135,9 +133,10 @@ func testS3Interface(t *testing.T, impl S3) {
 	})
 
 	t.Run("delete", func(t *testing.T) {
-		nd, err := impl.DeleteObjects(context.Background(), []string{"object/with/meta"})
-		AssertEqual(t, err, nil)
-		AssertEqual(t, nd, [][2]string{})
+		AssertEqual(t, impl.DeleteObject(context.Background(), "object/with/meta"), nil)
+		m, err := impl.GetObject(context.Background(), "object/with/meta", io.Discard)
+		AssertErrorIs(t, err, ErrObjectNotFound)
+		AssertEqual(t, m, nil)
 	})
 
 }
