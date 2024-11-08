@@ -216,3 +216,25 @@ func TestS3Api_encrypted(t *testing.T) {
 		BlockCipher: bc,
 	})
 }
+
+func TestS3Api_aws(t *testing.T) {
+	v := os.Getenv("S3_SMOKE_TEST_AWS_BUCKET_URL")
+	region := os.Getenv("S3_SMOKE_TEST_AWS_REGION")
+	accessKeyId := os.Getenv("S3_SMOKE_TEST_AWS_ACCESS_KEY_ID")
+	secretAccessKey := os.Getenv("S3_SMOKE_TEST_AWS_SECRET_ACCESS_KEY")
+	if v == "" || region == "" || accessKeyId == "" || secretAccessKey == "" {
+		t.Skip("S3_SMOKE_TEST_AWS_* not set")
+		return
+	}
+	u, _ := url.Parse(v)
+
+	client := &http.Client{}
+	client.Transport = WrapSigV4RoundTripper(http.DefaultTransport, func() time.Time {
+		return time.Now().UTC()
+	}, region, accessKeyId, secretAccessKey)
+
+	testS3Interface(t, NewS3Impl(
+		client,
+		u,
+	))
+}

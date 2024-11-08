@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/cipher"
+	"crypto/md5"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/xml"
 	"errors"
@@ -176,6 +176,9 @@ func NewS3Impl(client HttpDoer, bucketUrl *url.URL) S3 {
 	} else if bucketUrl == nil {
 		panic("bucketUrl cannot be nil")
 	}
+	if !strings.HasSuffix(bucketUrl.Path, "/") {
+		bucketUrl.Path += "/"
+	}
 	return &S3Impl{client: client, bucketUrl: bucketUrl}
 }
 
@@ -204,16 +207,17 @@ func (s *S3Impl) readBlob(ctx context.Context, key, method string, dst io.Writer
 			if resp.StatusCode == http.StatusNotFound {
 				return size, meta, ErrObjectNotFound
 			}
-			return size, meta, fmt.Errorf("failed to make request due to status code: %s", resp.Status)
+			bod, _ := io.ReadAll(resp.Body)
+			return size, meta, fmt.Errorf("failed to get objects due to status code: %s: %s", resp.Status, string(bod))
 		}
 		if dst != nil {
-			if r.Header.Get("x-amz-checksum-sha256") != "" {
-				dst = &hashWriter{H: sha256.New(), W: dst}
+			if r.Header.Get("Content-MD5") != "" {
+				dst = &hashWriter{H: md5.New(), W: dst}
 			}
 			if _, err := io.Copy(dst, resp.Body); err != nil {
 				return resp.ContentLength, meta, fmt.Errorf("failed to copy response body: %w", err)
 			}
-			if hA := r.Header.Get("x-amz-checksum-sha256"); hA != "" {
+			if hA := r.Header.Get("Content-MD5"); hA != "" {
 				if hB := base64.StdEncoding.EncodeToString(dst.(*hashWriter).H.Sum(nil)); hA != hB {
 					return resp.ContentLength, meta, fmt.Errorf("integrity check failed: %s != %s", hA, hB)
 				}
@@ -266,7 +270,8 @@ func (s *S3Impl) listObjectsV2(ctx context.Context, prefix, delimiter, continuat
 			_ = resp.Body.Close()
 		}()
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("failed to list objects: %s", resp.Status)
+			bod, _ := io.ReadAll(resp.Body)
+			return nil, fmt.Errorf("failed to list objects due to status code: %s: %s", resp.Status, string(bod))
 		}
 		var out ListBucketResult
 		if err := xml.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -316,7 +321,7 @@ func (s *S3Impl) PutObject(ctx context.Context, key string, meta map[string]stri
 	if raw, err := io.ReadAll(body); err != nil {
 		return fmt.Errorf("failed to read buffered body: %w", err)
 	} else {
-		h := sha256.New()
+		h := md5.New()
 		_, _ = h.Write(raw)
 		checksum = base64.StdEncoding.EncodeToString(h.Sum(nil))
 		body = bytes.NewReader(raw)
@@ -324,8 +329,7 @@ func (s *S3Impl) PutObject(ctx context.Context, key string, meta map[string]stri
 	if r, err := http.NewRequestWithContext(ctx, http.MethodPut, s.bucketUrl.ResolveReference(&url.URL{Path: key}).String(), body); err != nil {
 		return fmt.Errorf("failed to build request: %w", err)
 	} else {
-		r.Header.Set("x-amz-sdk-checksum-algorithm", "SHA256")
-		r.Header.Set("x-amz-checksum-sha256", checksum)
+		r.Header.Set("Content-MD5", checksum)
 		for s2, s3 := range meta {
 			r.Header.Set("x-amz-meta-"+s2, s3)
 		}
@@ -384,34 +388,40 @@ func (s *S3Impl) DeleteObjects(ctx context.Context, keys []string) (notDeleted [
 			body.Objects = append(body.Objects, deleteObjectsObject{Key: k})
 		}
 		rawBod, _ := xml.Marshal(body)
+		md5h := md5.New()
+		md5h.Write(rawBod)
 		if r, err := http.NewRequestWithContext(ctx, http.MethodPost, s.bucketUrl.ResolveReference(&url.URL{RawQuery: "delete"}).String(), bytes.NewReader(rawBod)); err != nil {
 			return nil, fmt.Errorf("failed to build request: %w", err)
-		} else if resp, err := s.client.Do(r); err != nil {
-			return nil, fmt.Errorf("failed to make request: %w", err)
 		} else {
-			defer func() {
-				_ = resp.Body.Close()
-			}()
-			if resp.StatusCode != http.StatusOK {
-				return nil, fmt.Errorf("failed to make delete request due to status code: %s", resp.Status)
+			r.Header.Set("Content-MD5", base64.StdEncoding.EncodeToString(md5h.Sum(nil)))
+			if resp, err := s.client.Do(r); err != nil {
+				return nil, fmt.Errorf("failed to make request: %w", err)
+			} else {
+				defer func() {
+					_ = resp.Body.Close()
+				}()
+				if resp.StatusCode != http.StatusOK {
+					bod, _ := io.ReadAll(resp.Body)
+					return nil, fmt.Errorf("failed to make delete request due to status code: %s: %s", resp.Status, string(bod))
+				}
+				buff, _ := io.ReadAll(resp.Body)
+				var e errorResp
+				if _ = xml.Unmarshal(buff, &e); e.Code != "" {
+					return nil, fmt.Errorf("delete request returned an error: %s: %s (%s)", e.Code, e.Message, e.RequestId)
+				}
+				var de deleteObjectsResp
+				if err := xml.Unmarshal(buff, &de); err != nil {
+					return nil, fmt.Errorf("failed to unmarshal delete response: %w", err)
+				}
+				notDeleted = make([][2]string, len(de.Errors))
+				for i, respError := range de.Errors {
+					notDeleted[i] = [2]string{respError.Key, respError.Code}
+				}
+				if len(notDeleted) > 0 {
+					err = fmt.Errorf("some objects failed to be deleted")
+				}
+				return notDeleted, err
 			}
-			buff, _ := io.ReadAll(resp.Body)
-			var e errorResp
-			if _ = xml.Unmarshal(buff, &e); e.Code != "" {
-				return nil, fmt.Errorf("delete request returned an error: %s: %s (%s)", e.Code, e.Message, e.RequestId)
-			}
-			var de deleteObjectsResp
-			if err := xml.Unmarshal(buff, &de); err != nil {
-				return nil, fmt.Errorf("failed to unmarshal delete response: %w", err)
-			}
-			notDeleted = make([][2]string, len(de.Errors))
-			for i, respError := range de.Errors {
-				notDeleted[i] = [2]string{respError.Key, respError.Code}
-			}
-			if len(notDeleted) > 0 {
-				err = fmt.Errorf("some objects failed to be deleted")
-			}
-			return notDeleted, err
 		}
 	}
 }

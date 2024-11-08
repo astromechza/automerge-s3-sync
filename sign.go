@@ -38,7 +38,14 @@ func uriEncode(in string, out io.Writer) {
 			_, _ = out.Write([]byte{bb})
 		} else {
 			_, _ = out.Write([]byte{'%'})
-			_, _ = hex.NewEncoder(out).Write([]byte{bb})
+			hb := make([]byte, 2)
+			_ = hex.Encode(hb, []byte{bb})
+			for i, b := range hb {
+				if b >= 'a' && b <= 'f' {
+					hb[i] = b - 32
+				}
+			}
+			_, _ = out.Write(hb)
 		}
 	}
 }
